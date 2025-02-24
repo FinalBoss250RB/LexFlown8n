@@ -18,7 +18,17 @@ import { useVueFlow, VueFlow, PanelPosition, MarkerType } from '@vue-flow/core';
 import { MiniMap } from '@vue-flow/minimap';
 import Node from './elements/nodes/CanvasNode.vue';
 import Edge from './elements/edges/CanvasEdge.vue';
-import { computed, onMounted, onUnmounted, provide, ref, toRef, useCssModule, watch } from 'vue';
+import {
+	computed,
+	nextTick,
+	onMounted,
+	onUnmounted,
+	provide,
+	ref,
+	toRef,
+	useCssModule,
+	watch,
+} from 'vue';
 import type { EventBus } from 'n8n-design-system';
 import { createEventBus } from 'n8n-design-system';
 import { useDeviceSupport } from '@n8n/composables/useDeviceSupport';
@@ -37,6 +47,7 @@ import CanvasBackground from './elements/background/CanvasBackground.vue';
 import { useCanvasTraversal } from '@/composables/useCanvasTraversal';
 import { NodeConnectionType } from 'n8n-workflow';
 import { useCanvasNodeHover } from '@/composables/useCanvasNodeHover';
+import { useCanvasLayout } from '@/composables/useCanvasLayout';
 
 const $style = useCssModule();
 
@@ -112,6 +123,7 @@ const {
 	getSelectedNodes: selectedNodes,
 	addSelectedNodes,
 	removeSelectedNodes,
+	nodesSelectionActive,
 	viewportRef,
 	fitView,
 	zoomIn,
@@ -138,6 +150,7 @@ const {
 	getDownstreamNodes,
 	getUpstreamNodes,
 } = useCanvasTraversal(vueFlow);
+const { layout } = useCanvasLayout({ id: props.id });
 
 const isPaneReady = ref(false);
 
@@ -244,38 +257,43 @@ function selectUpstreamNodes(id: string) {
 	onSelectNodes({ ids: [...upstreamNodes.map((node) => node.id), id] });
 }
 
-const keyMap = computed(() => ({
-	ctrl_c: emitWithSelectedNodes((ids) => emit('copy:nodes', ids)),
-	enter: emitWithLastSelectedNode((id) => onSetNodeActive(id)),
-	ctrl_a: () => addSelectedNodes(graphNodes.value),
-	// Support both key and code for zooming in and out
-	'shift_+|+|=|shift_Equal|Equal': async () => await onZoomIn(),
-	'shift+_|-|_|shift_Minus|Minus': async () => await onZoomOut(),
-	0: async () => await onResetZoom(),
-	1: async () => await onFitView(),
-	ArrowUp: emitWithLastSelectedNode(selectUpperSiblingNode),
-	ArrowDown: emitWithLastSelectedNode(selectLowerSiblingNode),
-	ArrowLeft: emitWithLastSelectedNode(selectLeftNode),
-	ArrowRight: emitWithLastSelectedNode(selectRightNode),
-	shift_ArrowLeft: emitWithLastSelectedNode(selectUpstreamNodes),
-	shift_ArrowRight: emitWithLastSelectedNode(selectDownstreamNodes),
+const keyMap = computed(() => {
+	const readOnlyKeymap = {
+		ctrl_c: emitWithSelectedNodes((ids) => emit('copy:nodes', ids)),
+		enter: emitWithLastSelectedNode((id) => onSetNodeActive(id)),
+		ctrl_a: () => addSelectedNodes(graphNodes.value),
+		// Support both key and code for zooming in and out
+		'shift_+|+|=|shift_Equal|Equal': async () => await onZoomIn(),
+		'shift+_|-|_|shift_Minus|Minus': async () => await onZoomOut(),
+		0: async () => await onResetZoom(),
+		1: async () => await onFitView(),
+		ArrowUp: emitWithLastSelectedNode(selectUpperSiblingNode),
+		ArrowDown: emitWithLastSelectedNode(selectLowerSiblingNode),
+		ArrowLeft: emitWithLastSelectedNode(selectLeftNode),
+		ArrowRight: emitWithLastSelectedNode(selectRightNode),
+		shift_ArrowLeft: emitWithLastSelectedNode(selectUpstreamNodes),
+		shift_ArrowRight: emitWithLastSelectedNode(selectDownstreamNodes),
+	};
 
-	...(props.readOnly
-		? {}
-		: {
-				ctrl_x: emitWithSelectedNodes((ids) => emit('cut:nodes', ids)),
-				'delete|backspace': emitWithSelectedNodes((ids) => emit('delete:nodes', ids)),
-				ctrl_d: emitWithSelectedNodes((ids) => emit('duplicate:nodes', ids)),
-				d: emitWithSelectedNodes((ids) => emit('update:nodes:enabled', ids)),
-				p: emitWithSelectedNodes((ids) => emit('update:nodes:pin', ids, 'keyboard-shortcut')),
-				f2: emitWithLastSelectedNode((id) => emit('update:node:name', id)),
-				tab: () => emit('create:node', 'tab'),
-				shift_s: () => emit('create:sticky'),
-				ctrl_alt_n: () => emit('create:workflow'),
-				ctrl_enter: () => emit('run:workflow'),
-				ctrl_s: () => emit('save:workflow'),
-			}),
-}));
+	if (props.readOnly) return readOnlyKeymap;
+
+	const fullKeymap = {
+		...readOnlyKeymap,
+		ctrl_x: emitWithSelectedNodes((ids) => emit('cut:nodes', ids)),
+		'delete|backspace': emitWithSelectedNodes((ids) => emit('delete:nodes', ids)),
+		ctrl_d: emitWithSelectedNodes((ids) => emit('duplicate:nodes', ids)),
+		d: emitWithSelectedNodes((ids) => emit('update:nodes:enabled', ids)),
+		p: emitWithSelectedNodes((ids) => emit('update:nodes:pin', ids, 'keyboard-shortcut')),
+		f2: emitWithLastSelectedNode((id) => emit('update:node:name', id)),
+		tab: () => emit('create:node', 'tab'),
+		shift_s: () => emit('create:sticky'),
+		ctrl_alt_n: () => emit('create:workflow'),
+		ctrl_enter: () => emit('run:workflow'),
+		ctrl_s: () => emit('save:workflow'),
+		shift_alt_t: onTidyUp,
+	};
+	return fullKeymap;
+});
 
 useKeybindings(keyMap, { disabled: disableKeyBindings });
 
@@ -302,6 +320,9 @@ const hoveredTriggerNode = useCanvasNodeHover(triggerNodes, vueFlow, (nodeRect) 
 }));
 
 watch(selectedNodes, (nodes) => {
+	if (nodes.length > 1) {
+		nodesSelectionActive.value = true;
+	}
 	if (!lastSelectedNode.value || !nodes.find((node) => node.id === lastSelectedNode.value?.id)) {
 		lastSelectedNode.value = nodes[nodes.length - 1];
 	}
@@ -584,7 +605,7 @@ function onOpenNodeContextMenu(
 	contextMenu.open(event, { source, nodeId: id });
 }
 
-function onContextMenuAction(action: ContextMenuAction, nodeIds: string[]) {
+async function onContextMenuAction(action: ContextMenuAction, nodeIds: string[]) {
 	switch (action) {
 		case 'add_node':
 			return emit('create:node', 'context_menu');
@@ -612,6 +633,20 @@ function onContextMenuAction(action: ContextMenuAction, nodeIds: string[]) {
 			return emit('update:node:name', nodeIds[0]);
 		case 'change_color':
 			return props.eventBus.emit('nodes:action', { ids: nodeIds, action: 'update:sticky:color' });
+		case 'tidy_up':
+			return await onTidyUp();
+	}
+}
+
+async function onTidyUp() {
+	const applyOnSelection = selectedNodes.value.length > 1;
+	const { nodes } = layout(applyOnSelection ? 'selection' : 'all');
+
+	onUpdateNodesPosition(nodes.map((node) => ({ id: node.id, position: { x: node.x, y: node.y } })));
+
+	if (!applyOnSelection) {
+		await nextTick();
+		await onFitView();
 	}
 }
 
@@ -834,6 +869,7 @@ provide(CanvasKey, {
 			@zoom-in="onZoomIn"
 			@zoom-out="onZoomOut"
 			@reset-zoom="onResetZoom"
+			@tidy-up="onTidyUp"
 		/>
 
 		<Suspense>
