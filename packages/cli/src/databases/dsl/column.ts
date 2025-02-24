@@ -1,7 +1,15 @@
 import type { Driver, TableColumnOptions } from '@n8n/typeorm';
 
 export class Column {
-	private type: 'int' | 'boolean' | 'varchar' | 'text' | 'json' | 'timestamp' | 'uuid';
+	private type:
+		| 'int'
+		| 'boolean'
+		| 'varchar'
+		| 'text'
+		| 'json'
+		| 'timestamptz'
+		| 'timestamp'
+		| 'uuid';
 
 	private isGenerated = false;
 
@@ -14,6 +22,8 @@ export class Column {
 	private defaultValue: unknown;
 
 	private primaryKeyConstraintName: string | undefined;
+
+	private commentValue: string | undefined;
 
 	constructor(private name: string) {}
 
@@ -43,7 +53,22 @@ export class Column {
 		return this;
 	}
 
+	/**
+	 * @deprecated use `timestampTimezone` instead
+	 **/
 	timestamp(msPrecision = 3) {
+		this.type = 'timestamptz';
+		this.length = msPrecision ?? 'auto';
+		return this;
+	}
+
+	timestampTimezone(msPrecision = 3) {
+		this.type = 'timestamptz';
+		this.length = msPrecision ?? 'auto';
+		return this;
+	}
+
+	timestampNoTimezone(msPrecision = 3) {
 		this.type = 'timestamp';
 		this.length = msPrecision ?? 'auto';
 		return this;
@@ -80,6 +105,11 @@ export class Column {
 		return this;
 	}
 
+	comment(comment: string) {
+		this.commentValue = comment;
+		return this;
+	}
+
 	// eslint-disable-next-line complexity
 	toOptions(driver: Driver): TableColumnOptions {
 		const { name, type, isNullable, isPrimary, isGenerated, length, primaryKeyConstraintName } =
@@ -100,8 +130,10 @@ export class Column {
 			options.type = 'integer';
 		} else if (type === 'boolean' && isMysql) {
 			options.type = 'tinyint(1)';
-		} else if (type === 'timestamp') {
+		} else if (type === 'timestamptz') {
 			options.type = isPostgres ? 'timestamptz' : 'datetime';
+		} else if (type === 'timestamp') {
+			options.type = isPostgres ? 'timestamp' : 'datetime';
 		} else if (type === 'json' && isSqlite) {
 			options.type = 'text';
 		} else if (type === 'uuid') {
@@ -111,7 +143,10 @@ export class Column {
 			if (isSqlite) options.type = 'varchar';
 		}
 
-		if ((type === 'varchar' || type === 'timestamp') && length !== 'auto') {
+		if (
+			(type === 'varchar' || type === 'timestamptz' || type === 'timestamp') &&
+			length !== 'auto'
+		) {
 			options.type = `${options.type}(${length})`;
 		}
 
@@ -125,13 +160,17 @@ export class Column {
 		}
 
 		if (this.defaultValue !== undefined) {
-			if (type === 'timestamp' && this.defaultValue === 'NOW()') {
+			if ((type === 'timestamptz' || type === 'timestamp') && this.defaultValue === 'NOW()') {
 				options.default = isSqlite
 					? "STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')"
 					: 'CURRENT_TIMESTAMP(3)';
 			} else {
 				options.default = this.defaultValue;
 			}
+		}
+
+		if (this.commentValue) {
+			options.comment = this.commentValue;
 		}
 
 		return options;
