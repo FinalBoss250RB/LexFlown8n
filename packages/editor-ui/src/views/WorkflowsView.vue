@@ -15,6 +15,7 @@ import {
 	EnterpriseEditionFeature,
 	VIEWS,
 	DEFAULT_WORKFLOW_PAGE_SIZE,
+	MODAL_CONFIRM,
 } from '@/constants';
 import type { IUser, UserAction, WorkflowListResource, WorkflowListItem } from '@/Interface';
 import { useUIStore } from '@/stores/ui.store';
@@ -47,6 +48,9 @@ import type { PathItem } from 'n8n-design-system/components/N8nBreadcrumbs/Bread
 import { ProjectTypes } from '@/types/projects.types';
 import { FOLDER_LIST_ITEM_ACTIONS } from '@/components/Folders/constants';
 import { debounce } from 'lodash-es';
+import { useMessage } from '@/composables/useMessage';
+import { useToast } from '@/composables/useToast';
+import { useFoldersStore } from '@/stores/folders.store';
 
 interface Filters extends BaseFilters {
 	status: string | boolean;
@@ -70,6 +74,8 @@ const WORKFLOWS_SORT_MAP = {
 const i18n = useI18n();
 const route = useRoute();
 const router = useRouter();
+const message = useMessage();
+const toast = useToast();
 
 const sourceControlStore = useSourceControlStore();
 const usersStore = useUsersStore();
@@ -80,6 +86,8 @@ const projectsStore = useProjectsStore();
 const telemetry = useTelemetry();
 const uiStore = useUIStore();
 const tagsStore = useTagsStore();
+const foldersStore = useFoldersStore();
+
 const documentTitle = useDocumentTitle();
 const { callDebounced } = useDebounce();
 
@@ -97,22 +105,21 @@ const workflowsAndFolders = ref<WorkflowListResource[]>([]);
 
 const easyAICalloutVisible = ref(true);
 
-const currentFolder = ref<FolderResource | undefined>(undefined);
-
 const currentPage = ref(1);
 const pageSize = ref(DEFAULT_WORKFLOW_PAGE_SIZE);
 const currentSort = ref('updatedAt:desc');
 
-const folderCardActions = ref<UserAction[]>([
+const folderActions = ref<Array<UserAction & { onlyAvailableOn?: 'mainBreadcrumbs' | 'card' }>>([
 	{
 		label: 'Open',
 		value: FOLDER_LIST_ITEM_ACTIONS.OPEN,
 		disabled: false,
+		onlyAvailableOn: 'card',
 	},
 	{
 		label: 'Create Folder',
 		value: FOLDER_LIST_ITEM_ACTIONS.CREATE,
-		disabled: true,
+		disabled: false,
 	},
 	{
 		label: 'Create Workflow',
@@ -145,7 +152,16 @@ const folderCardActions = ref<UserAction[]>([
 		disabled: true,
 	},
 ]);
-
+const folderCardActions = computed(() =>
+	folderActions.value.filter(
+		(action) => !action.onlyAvailableOn || action.onlyAvailableOn === 'card',
+	),
+);
+const mainBreadcrumbsActions = computed(() =>
+	folderActions.value.filter(
+		(action) => !action.onlyAvailableOn || action.onlyAvailableOn === 'mainBreadcrumbs',
+	),
+);
 const readOnlyEnv = computed(() => sourceControlStore.preferences.branchReadOnly);
 const foldersEnabled = computed(() => settingsStore.settings.folders.enabled);
 const isOverviewPage = computed(() => route.name === VIEWS.WORKFLOWS);
@@ -153,18 +169,29 @@ const currentUser = computed(() => usersStore.currentUser ?? ({} as IUser));
 const isShareable = computed(
 	() => settingsStore.isEnterpriseFeatureEnabled[EnterpriseEditionFeature.Sharing],
 );
-
 const showFolders = computed(() => foldersEnabled.value && !isOverviewPage.value);
+const currentFolder = computed(() => foldersStore.currentFolderInfo);
 
-const mainBreadcrumbsItems = computed<PathItem[] | undefined>(() => {
-	if (!showFolders.value || !currentFolder.value) return;
-	const items: PathItem[] = [];
-	items.push({
-		id: currentFolder.value.id,
-		label: currentFolder.value.name,
-	});
-	return items;
-});
+const mainBreadcrumbsItems = computed<Array<PathItem & { parentFolder?: string }> | undefined>(
+	() => {
+		if (!showFolders.value || !currentFolder.value) return;
+		const items: Array<PathItem & { parentFolder?: string }> = [];
+		const parent = foldersStore.getCachedFolder(currentFolder.value.parentFolder ?? '');
+		if (parent) {
+			items.push({
+				id: parent.id,
+				label: parent.name,
+				href: `/projects/${route.params.projectId}/folders/${parent.id}/workflows`,
+				parentFolder: parent.parentFolder,
+			});
+		}
+		items.push({
+			id: currentFolder.value.id,
+			label: currentFolder.value.name,
+		});
+		return items;
+	},
+);
 
 const currentProject = computed(() => projectsStore.currentProject);
 
@@ -173,6 +200,13 @@ const projectName = computed(() => {
 		return i18n.baseText('projects.menu.personal');
 	}
 	return currentProject.value?.name;
+});
+
+const currentParentName = computed(() => {
+	if (currentFolder.value) {
+		return currentFolder.value.name;
+	}
+	return projectName.value;
 });
 
 const workflowListResources = computed<Resource[]>(() => {
@@ -259,9 +293,7 @@ watch(
 watch(
 	() => route.params?.folderId,
 	async (newVal) => {
-		if (!newVal) {
-			currentFolder.value = undefined;
-		}
+		foldersStore.currentFolderId = newVal as string;
 		await fetchWorkflows();
 	},
 );
@@ -302,7 +334,7 @@ const addWorkflow = () => {
 	uiStore.nodeViewInitialized = false;
 	void router.push({
 		name: VIEWS.NEW_WORKFLOW,
-		query: { projectId: route.params?.projectId },
+		query: { projectId: route.params?.projectId, parentFolderId: route.params?.folderId },
 	});
 
 	telemetry.track('User clicked add workflow button', {
@@ -319,7 +351,6 @@ const trackEmptyCardClick = (option: 'blank' | 'templates' | 'courses') => {
 
 const initialize = async () => {
 	loading.value = true;
-	currentFolder.value = undefined;
 	await setFiltersFromQueryString();
 	const [, resourcesPage] = await Promise.all([
 		usersStore.fetchUsers(),
@@ -363,8 +394,12 @@ const fetchWorkflows = async () => {
 		},
 		showFolders.value,
 	);
-	// @ts-expect-error - Once we have an endpoint to fetch the path based on Id, we should remove this and fetch the path from the endpoint
-	currentFolder.value = fetchedResources[0]?.parentFolder;
+	// TODO: Fetch breadcrumbs items from the API
+	foldersStore.cacheFolders(
+		fetchedResources
+			.filter((resource) => resource.resource === 'folder')
+			.map((r) => ({ id: r.id, name: r.name, parentFolder: r.parentFolder?.id })),
+	);
 
 	delayedLoading.cancel();
 	workflowsAndFolders.value = fetchedResources;
@@ -539,8 +574,104 @@ const onWorkflowActiveToggle = (data: { id: string; active: boolean }) => {
 	workflow.active = data.active;
 };
 
-const onFolderOpened = (data: { folder: FolderResource }) => {
-	currentFolder.value = data.folder;
+const createFolder = async (parent: { id: string; name: string; type: 'project' | 'folder' }) => {
+	const promptResponsePromise = message.prompt(
+		i18n.baseText('folders.add.to.parent.message', { interpolate: { parent: parent.name } }),
+		{
+			confirmButtonText: i18n.baseText('generic.create'),
+			cancelButtonText: i18n.baseText('generic.cancel'),
+			inputErrorMessage: i18n.baseText('folders.add.invalidName.message'),
+			inputValue: '',
+			inputPattern: /^[a-zA-Z0-9-_ ]{1,100}$/,
+			customClass: 'add-folder-modal',
+		},
+	);
+	const promptResponse = await promptResponsePromise;
+	if (promptResponse.action === MODAL_CONFIRM) {
+		const folderName = promptResponse.value;
+		try {
+			const newFolder = await foldersStore.createFolder(
+				folderName,
+				route.params.projectId as string,
+				parent.type === 'folder' ? parent.id : undefined,
+			);
+			let newFolderURL = `/projects/${route.params.projectId}`;
+			if (newFolder.parentFolder) {
+				newFolderURL = `/projects/${route.params.projectId}/folders/${newFolder.parentFolder.id}/workflows`;
+			}
+			toast.showMessage({
+				title: i18n.baseText('folders.add.success.title'),
+				message: i18n.baseText('folders.add.success.message', {
+					interpolate: {
+						link: newFolderURL,
+						name: newFolder.name,
+					},
+				}),
+				type: 'success',
+			});
+			// TODO: Do not fetch if we are on empty state
+			await fetchWorkflows();
+		} catch (error) {
+			toast.showError(error, 'Error creating folder');
+		}
+	}
+};
+
+const createFolderInCurrent = async () => {
+	if (!route.params.projectId) return;
+	const currentParent = foldersStore.currentFolderInfo?.name || projectName.value;
+	if (!currentParent) return;
+	await createFolder({
+		id: (route.params.folderId as string) ?? '-1',
+		name: currentParent,
+		type: currentFolder.value ? 'folder' : 'project',
+	});
+};
+
+const onBreadcrumbItemClick = (item: PathItem) => {
+	if (item.href) {
+		void router
+			.push(item.href)
+			.then(() => {
+				foldersStore.currentFolderId = item.id;
+			})
+			.catch((error) => {
+				toast.showError(error, 'Error navigating to folder');
+			});
+	}
+};
+
+const onBreadCrumbsAction = async (action: string) => {
+	switch (action) {
+		case FOLDER_LIST_ITEM_ACTIONS.CREATE:
+			if (!route.params.projectId) return;
+			const currentParent = foldersStore.currentFolderInfo?.name || projectName.value;
+			if (!currentParent) return;
+			await createFolder({
+				id: (route.params.folderId as string) ?? '-1',
+				name: currentParent,
+				type: currentFolder.value ? 'folder' : 'project',
+			});
+			break;
+		default:
+			break;
+	}
+};
+
+const onFolderCardAction = async (payload: { action: string; folderId: string }) => {
+	const clickedFolder = foldersStore.getCachedFolder(payload.folderId);
+	if (!clickedFolder) return;
+	switch (payload.action) {
+		case FOLDER_LIST_ITEM_ACTIONS.CREATE:
+			await createFolder({
+				id: clickedFolder.id,
+				name: clickedFolder.name,
+				type: 'folder',
+			});
+			break;
+		default:
+			break;
+	}
 };
 </script>
 
@@ -567,7 +698,28 @@ const onFolderOpened = (data: { folder: FolderResource }) => {
 		@sort="onSortUpdated"
 	>
 		<template #header>
-			<ProjectHeader />
+			<ProjectHeader @create-folder="createFolderInCurrent" />
+		</template>
+		<template v-if="showFolders" #add-button>
+			<N8nTooltip placement="top">
+				<template #content>
+					{{
+						currentParentName
+							? i18n.baseText('folders.add.to.parent.message', {
+									interpolate: { parent: currentParentName },
+								})
+							: i18n.baseText('folders.add.here.message')
+					}}
+				</template>
+				<N8nButton
+					size="large"
+					icon="folder-plus"
+					type="tertiary"
+					data-test-id="add-folder-button"
+					:class="$style['add-folder-button']"
+					@click="createFolderInCurrent"
+				/>
+			</N8nTooltip>
 		</template>
 		<template #callout>
 			<N8nCallout
@@ -599,21 +751,31 @@ const onFolderOpened = (data: { folder: FolderResource }) => {
 			</N8nCallout>
 		</template>
 		<template #breadcrumbs>
-			<n8n-breadcrumbs
-				v-if="mainBreadcrumbsItems"
-				:items="mainBreadcrumbsItems"
-				:highlight-last-item="false"
-				:path-truncated="currentFolder !== undefined"
-				data-test-id="folder-card-breadcrumbs"
-			>
-				<template v-if="currentProject" #prepend>
-					<div :class="$style['home-project']">
-						<n8n-link :to="`/projects/${currentProject.id}`">
-							<N8nText size="large" color="text-base">{{ projectName }}</N8nText>
-						</n8n-link>
-					</div>
-				</template>
-			</n8n-breadcrumbs>
+			<div :class="$style['breadcrumbs-container']">
+				<n8n-breadcrumbs
+					v-if="mainBreadcrumbsItems"
+					:items="mainBreadcrumbsItems"
+					:highlight-last-item="false"
+					:path-truncated="mainBreadcrumbsItems[0].parentFolder"
+					data-test-id="folder-card-breadcrumbs"
+					@item-selected="onBreadcrumbItemClick"
+				>
+					<template v-if="currentProject" #prepend>
+						<div :class="$style['home-project']">
+							<n8n-link :to="`/projects/${currentProject.id}`">
+								<N8nText size="large" color="text-base">{{ projectName }}</N8nText>
+							</n8n-link>
+						</div>
+					</template>
+				</n8n-breadcrumbs>
+				<n8n-action-toggle
+					v-if="mainBreadcrumbsItems"
+					:actions="mainBreadcrumbsActions"
+					theme="dark"
+					data-test-id="folder-breadcrumbs-actions"
+					@action="onBreadCrumbsAction"
+				/>
+			</div>
 		</template>
 		<template #item="{ item: data }">
 			<FolderCard
@@ -621,7 +783,7 @@ const onFolderOpened = (data: { folder: FolderResource }) => {
 				:data="data as FolderResource"
 				:actions="folderCardActions"
 				class="mb-2xs"
-				@folder-opened="onFolderOpened"
+				@action="onFolderCardAction"
 			/>
 			<WorkflowCard
 				v-else
@@ -773,5 +935,30 @@ const onFolderOpened = (data: { folder: FolderResource }) => {
 .home-project {
 	display: flex;
 	align-items: center;
+}
+
+.add-folder-button {
+	width: 40px;
+}
+
+.breadcrumbs-container {
+	display: flex;
+	align-items: center;
+}
+</style>
+
+<style lang="scss">
+.add-folder-modal {
+	width: 500px;
+	padding-bottom: 0;
+	.el-message-box__message {
+		font-size: var(--font-size-xl);
+	}
+	.el-message-box__btns {
+		padding: 0 var(--spacing-l) var(--spacing-l);
+	}
+	.el-message-box__content {
+		padding: var(--spacing-l);
+	}
 }
 </style>
